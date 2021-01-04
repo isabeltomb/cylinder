@@ -17,85 +17,100 @@
 
 use std::env;
 use std::fs::File;
-use std::io::Read;
-use std::path::PathBuf;
+use std::io::{ErrorKind, Read};
+use std::path::{Path, PathBuf};
 
 use crate::error::KeyLoadError;
 use crate::PrivateKey;
 
-// determines the key name and path of the private key file
-pub fn load_user_key(
-    key_name: Option<&str>,
-    default_path: &str,
-) -> Result<PrivateKey, KeyLoadError> {
-    let name: String = match key_name {
-        Some(name) => String::from(name),
-        None => {
-            if let Ok(user) = env::var("USER") {
-                user
-            } else {
-                whoami::username()
-            }
+// let search_path == cylinder::current_user_search_path();
+// let search_path == vec![Path::new("/etc/splinter/keys")];
+//
+// let key_name = cylinder::current_user_key_name();
+// let key_name = "splinterd";
+//
+// let key = cylinder::load_key(key_name, search_path)?;
+
+pub fn current_user_search_path() -> Vec<PathBuf> {
+    match env::var("CYLINDER_PATH") {
+        Ok(value) => {
+            value.split(':').map(|s| {
+                Path::new(s).to_path_buf()
+            }).collect()
         }
-    };
+        Err(env::VarError::NotUnicode(os_string)) => {
+            let mut dir = match dirs::home_dir() {
+                Some(dir) => dir,
+                None => Path::new(".").to_path_buf(),
+            };
+            dir.push(".cylinder");
+            dir.push("keys");
+            println!("unable to parse path {:?} using default {:?}", os_string, dir);
+            vec![dir]
+        }
+        Err(env::VarError::NotPresent) => {
+            let mut dir = match dirs::home_dir() {
+                Some(dir) => dir,
+                None => Path::new(".").to_path_buf(),
+            };
+            dir.push(".cylinder");
+            dir.push("keys");
+            vec![dir]
+        }
+    }
+}
 
-    // if the default path is an environment variable retrieve its value
-    let key_path = match env::var(&default_path) {
-        Ok(path) => path,
-        Err(_) => default_path.to_string(),
-    };
+pub fn current_user_key_name() -> String {
+    match env::var("CYLINDER_KEY_NAME") {
+        Ok(value) => {
+            value
+        }
+        Err(env::VarError::NotUnicode(_os_string)) => {
+            unimplemented!()
+        }
+        Err(env::VarError::NotPresent) => {
+            unimplemented!()
+        }
+    }
+}
 
-    // check if the key name is a path
-    if name.contains('/') {
-        Ok(load_key_file(None, &name)?)
-    } else {
-        // if the key name is not a path check to see if it is an environment variable
-        let name = match env::var(&name) {
-            Ok(val) => val,
-            Err(_) => name,
-        };
-        // if key_path contains multiple paths check each path
-        if key_path.contains(':') {
-            let paths = key_path.split(':');
-            for path in paths {
-                match load_key_file(Some(name.clone()), &path) {
-                    Ok(key) => return Ok(key),
-                    Err(_) => continue,
+pub fn load_key(
+    name: &str,
+    search_path: Vec<PathBuf>,
+) -> Result<Option<PrivateKey>, KeyLoadError> {
+    match search_path.iter().find_map(|path| {
+        let mut key_path = path.clone();
+        key_path.push(name);
+        key_path.set_extension(".priv");
+
+        if key_path.exists() && key_path.is_file() {
+            match File::open(key_path) {
+                Ok(f) => Some(Ok(f)),
+                Err(e) => match e.kind() {
+                    ErrorKind::PermissionDenied => None,
+                    _ => Some(Err(e)),
                 }
             }
-            Err(KeyLoadError(format!(
-                "Failed to find key file in {}",
-                &key_path
-            )))
         } else {
-            Ok(load_key_file(Some(name), &key_path)?)
+            None
         }
+    }) {
+        Some(Ok(file)) => {
+            match load_key_from_file(file) {
+                Ok(key) => Ok(Some(key)),
+                Err(e) => Err(e),
+            }
+        },
+        Some(Err(e)) => {
+            // FIXME - this should take a source similar to InternalError
+            Err(KeyLoadError(format!("{}", e)))
+        }
+        None => Ok(None),
     }
 }
 
-// constructs the full path of the private key file
-fn load_key_file(key_name: Option<String>, key_path: &str) -> Result<PrivateKey, KeyLoadError> {
-    let mut path = PathBuf::from(key_path);
-    if let Some(key_name) = key_name {
-        path.push(key_name);
-    }
-    if path.exists() {
-        read_private_key(path)
-    } else {
-        path.set_extension("priv");
-        if path.exists() {
-            read_private_key(path)
-        } else {
-            Err(KeyLoadError(format!(
-                "Failed to load key: could not be found {}",
-                path.as_path().display()
-            )))
-        }
-    }
-}
-
-// Reads a private key from the given path
-fn read_private_key(path: PathBuf) -> Result<PrivateKey, KeyLoadError> {
+pub fn load_key_from_path(path: &Path) -> Result<PrivateKey, KeyLoadError>
+{
     let mut file = File::open(&path).map_err(|err| {
         KeyLoadError(format!(
             "Unable to open key file '{}': {}",
@@ -123,196 +138,319 @@ fn read_private_key(path: PathBuf) -> Result<PrivateKey, KeyLoadError> {
         .map_err(|err| KeyLoadError(format!("unable to create private key from hex: {}", err)))?)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::PrivateKey;
+fn load_key_from_file(file: File) -> Result<PrivateKey, KeyLoadError>
+{
+    let mut key_file = file;
 
-    use std::fs::File;
-    use std::io::Write;
-    use tempdir::TempDir;
+    let mut buf = String::new();
+    key_file.read_to_string(&mut buf).map_err(|err| {
+        KeyLoadError(format!(
+            "Unable to read key file '{:?}': {}",
+            key_file,
+            err,
+        ))
+    })?;
+    let key = match buf.lines().next() {
+        Some(k) => k.trim().to_string(),
+        None => {
+            return Err(KeyLoadError(format!("Empty key file: {:?}", key_file)));
+        }
+    };
 
-    // tests that when an existing key name and default path are given load_user_key returns the
-    // private key
-    #[test]
-    fn retrieve_key_success() {
-        let temp_dir = TempDir::new("test_key_dir").expect("Failed to create temp dir");
-
-        let key_name = "test_key.priv";
-        let default_path = temp_dir
-            .path()
-            .to_str()
-            .expect("Failed to get default path");
-
-        let key_path = temp_dir
-            .path()
-            .join(key_name)
-            .to_str()
-            .expect("Failed to get path")
-            .to_string();
-
-        let mut temp_file =
-            File::create(&key_path).expect("Unable to create temp private key file");
-
-        let private_key = PrivateKey::new(vec![
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 1,
-        ]);
-
-        writeln!(temp_file, "{}", private_key.as_hex())
-            .expect("Unable to write private key to file");
-
-        let retrieved_private_key =
-            load_user_key(Some(key_name), default_path).expect("Unable retrieve key from file");
-
-        assert_eq!(retrieved_private_key.into_bytes(), private_key.into_bytes(),);
-    }
-
-    // tests that when no key name is given and the USER environment variable is set the value of
-    // the user environment variable will be used as the key_name and load_user_key returns the
-    // private key successfully
-    #[test]
-    fn retrieve_key_success_no_keyname() {
-        let temp_dir = TempDir::new("test_key_dir").expect("Failed to create temp dir");
-
-        let key = "USER";
-        env::set_var(key, "test_user");
-        assert_eq!(env::var("USER"), Ok("test_user".to_string()));
-
-        let default_path = temp_dir
-            .path()
-            .to_str()
-            .expect("Failed to get default path");
-
-        let key_path = temp_dir
-            .path()
-            .join("test_user.priv")
-            .to_str()
-            .expect("Failed to get path")
-            .to_string();
-
-        let mut temp_file =
-            File::create(&key_path).expect("Unable to create temp private key file");
-
-        let private_key = PrivateKey::new(vec![
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 1,
-        ]);
-
-        writeln!(temp_file, "{}", private_key.as_hex())
-            .expect("Unable to write private key to file");
-
-        let retrieved_private_key =
-            load_user_key(None, default_path).expect("Unable retrieve key from file");
-
-        assert_eq!(retrieved_private_key.into_bytes(), private_key.into_bytes(),);
-    }
-
-    // tests that when an environment variable is given as the default path load_user_key
-    // successfully returns the private key
-    #[test]
-    fn retrieve_key_success_environment_var() {
-        let temp_dir = TempDir::new("test_key_dir").expect("Failed to create temp dir");
-
-        let key_name = "test_key.priv";
-        let default_path = temp_dir
-            .path()
-            .to_str()
-            .expect("Failed to get default path");
-
-        let key_path = temp_dir
-            .path()
-            .join(key_name)
-            .to_str()
-            .expect("Failed to get path")
-            .to_string();
-
-        let key = "TEST_KEY_PATH";
-        env::set_var(key, default_path);
-        assert_eq!(env::var("TEST_KEY_PATH"), Ok(default_path.to_string()));
-
-        let mut temp_file =
-            File::create(&key_path).expect("Unable to create temp private key file");
-
-        let private_key = PrivateKey::new(vec![
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 1,
-        ]);
-
-        writeln!(temp_file, "{}", private_key.as_hex())
-            .expect("Unable to write private key to file");
-
-        let retrieved_private_key =
-            load_user_key(Some(key_name), "TEST_KEY_PATH").expect("Unable retrieve key from file");
-
-        assert_eq!(retrieved_private_key.into_bytes(), private_key.into_bytes(),);
-    }
-
-    // tests that when an environment variable is given as the default path and
-    // it contains multiple paths load_user_key uses the correct path and successfully
-    // returns the private key
-    #[test]
-    fn retrieve_key_success_environment_var2() {
-        let temp_dir = TempDir::new("test_key_dir").expect("Failed to create temp dir");
-
-        let key_name = "test_key.priv";
-        let default_path = temp_dir
-            .path()
-            .to_str()
-            .expect("Failed to get default path");
-
-        let key_path = temp_dir
-            .path()
-            .join(key_name)
-            .to_str()
-            .expect("Failed to get path")
-            .to_string();
-
-        let paths = format!("test_key/keys:{}", default_path);
-        let key = "TEST_PATH_MULTIPLE";
-        env::set_var(key, paths.clone());
-        assert_eq!(
-            env::var("TEST_PATH_MULTIPLE"),
-            Ok(paths.clone().to_string())
-        );
-
-        let mut temp_file =
-            File::create(&key_path).expect("Unable to create temp private key file");
-
-        let private_key = PrivateKey::new(vec![
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 1,
-        ]);
-
-        writeln!(temp_file, "{}", private_key.as_hex())
-            .expect("Unable to write private key to file");
-
-        let retrieved_private_key = load_user_key(Some(key_name), "TEST_PATH_MULTIPLE")
-            .expect("Unable retrieve key from file");
-
-        assert_eq!(retrieved_private_key.into_bytes(), private_key.into_bytes(),);
-    }
-
-    // tests that if the given file with the given key name is empty load_user_key will fail
-    #[test]
-    fn retrieve_key_fail_empty_file() {
-        let temp_dir = TempDir::new("test_key_dir").expect("Failed to create temp dir");
-
-        let key_name = "test_key.priv";
-        let default_path = temp_dir
-            .path()
-            .to_str()
-            .expect("Failed to get default path");
-
-        let key_path = temp_dir
-            .path()
-            .join(key_name)
-            .to_str()
-            .expect("Failed to get path")
-            .to_string();
-
-        File::create(&key_path).expect("Unable to create temp private key file");
-
-        assert!(load_user_key(Some(key_name), default_path).is_err());
-    }
+    Ok(PrivateKey::new_from_hex(&key)
+        .map_err(|err| KeyLoadError(format!("unable to create private key from hex: {}", err)))?)
 }
+
+// // determines the key name and path of the private key file
+// pub fn load_user_key(
+//     key_name: Option<&str>,
+//     default_path: &str,
+// ) -> Result<PrivateKey, KeyLoadError> {
+//     let name: String = match key_name {
+//         Some(name) => String::from(name),
+//         None => {
+//             if let Ok(user) = env::var("USER") {
+//                 user
+//             } else {
+//                 whoami::username()
+//             }
+//         }
+//     };
+
+//     // if the default path is an environment variable retrieve its value
+//     let key_path = match env::var(&default_path) {
+//         Ok(path) => path,
+//         Err(_) => default_path.to_string(),
+//     };
+
+//     // check if the key name is a path
+//     if name.contains('/') {
+//         Ok(load_key_file(None, &name)?)
+//     } else {
+//         // if the key name is not a path check to see if it is an environment variable
+//         let name = match env::var(&name) {
+//             Ok(val) => val,
+//             Err(_) => name,
+//         };
+//         // if key_path contains multiple paths check each path
+//         if key_path.contains(':') {
+//             let paths = key_path.split(':');
+//             for path in paths {
+//                 match load_key_file(Some(name.clone()), &path) {
+//                     Ok(key) => return Ok(key),
+//                     Err(_) => continue,
+//                 }
+//             }
+//             Err(KeyLoadError(format!(
+//                 "Failed to find key file in {}",
+//                 &key_path
+//             )))
+//         } else {
+//             Ok(load_key_file(Some(name), &key_path)?)
+//         }
+//     }
+// }
+
+// constructs the full path of the private key file
+// fn load_key_file(key_name: Option<String>, key_path: &str) -> Result<PrivateKey, KeyLoadError> {
+//     let mut path = PathBuf::from(key_path);
+//     if let Some(key_name) = key_name {
+//         path.push(key_name);
+//     }
+//     if path.exists() {
+//         read_private_key(path)
+//     } else {
+//         path.set_extension("priv");
+//         if path.exists() {
+//             read_private_key(path)
+//         } else {
+//             Err(KeyLoadError(format!(
+//                 "Failed to load key: could not be found {}",
+//                 path.as_path().display()
+//             )))
+//         }
+//     }
+// }
+
+// // Reads a private key from the given path
+// fn read_private_key(path: PathBuf) -> Result<PrivateKey, KeyLoadError> {
+    // let mut file = File::open(&path).map_err(|err| {
+    //     KeyLoadError(format!(
+    //         "Unable to open key file '{}': {}",
+    //         path.display(),
+    //         err,
+    //     ))
+    // })?;
+
+    // let mut buf = String::new();
+    // file.read_to_string(&mut buf).map_err(|err| {
+    //     KeyLoadError(format!(
+    //         "Unable to read key file '{}': {}",
+    //         path.display(),
+    //         err,
+    //     ))
+    // })?;
+    // let key = match buf.lines().next() {
+    //     Some(k) => k.trim().to_string(),
+    //     None => {
+    //         return Err(KeyLoadError(format!("Empty key file: {}", path.display())));
+    //     }
+    // };
+
+    // Ok(PrivateKey::new_from_hex(&key)
+    //     .map_err(|err| KeyLoadError(format!("unable to create private key from hex: {}", err)))?)
+// }
+
+// #[cfg(test)]
+// mod tests {
+//     use super::*;
+//     use crate::PrivateKey;
+
+//     use std::fs::File;
+//     use std::io::Write;
+//     use tempdir::TempDir;
+
+//     // tests that when an existing key name and default path are given load_user_key returns the
+//     // private key
+//     #[test]
+//     fn retrieve_key_success() {
+//         let temp_dir = TempDir::new("test_key_dir").expect("Failed to create temp dir");
+
+//         let key_name = "test_key.priv";
+//         let default_path = temp_dir
+//             .path()
+//             .to_str()
+//             .expect("Failed to get default path");
+
+//         let key_path = temp_dir
+//             .path()
+//             .join(key_name)
+//             .to_str()
+//             .expect("Failed to get path")
+//             .to_string();
+
+//         let mut temp_file =
+//             File::create(&key_path).expect("Unable to create temp private key file");
+
+//         let private_key = PrivateKey::new(vec![
+//             0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+//             0, 0, 1,
+//         ]);
+
+//         writeln!(temp_file, "{}", private_key.as_hex())
+//             .expect("Unable to write private key to file");
+
+//         let retrieved_private_key =
+//             load_user_key(Some(key_name), default_path).expect("Unable retrieve key from file");
+
+//         assert_eq!(retrieved_private_key.into_bytes(), private_key.into_bytes(),);
+//     }
+
+//     // tests that when no key name is given and the USER environment variable is set the value of
+//     // the user environment variable will be used as the key_name and load_user_key returns the
+//     // private key successfully
+//     #[test]
+//     fn retrieve_key_success_no_keyname() {
+//         let temp_dir = TempDir::new("test_key_dir").expect("Failed to create temp dir");
+
+//         let key = "USER";
+//         env::set_var(key, "test_user");
+//         assert_eq!(env::var("USER"), Ok("test_user".to_string()));
+
+//         let default_path = temp_dir
+//             .path()
+//             .to_str()
+//             .expect("Failed to get default path");
+
+//         let key_path = temp_dir
+//             .path()
+//             .join("test_user.priv")
+//             .to_str()
+//             .expect("Failed to get path")
+//             .to_string();
+
+//         let mut temp_file =
+//             File::create(&key_path).expect("Unable to create temp private key file");
+
+//         let private_key = PrivateKey::new(vec![
+//             0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+//             0, 0, 1,
+//         ]);
+
+//         writeln!(temp_file, "{}", private_key.as_hex())
+//             .expect("Unable to write private key to file");
+
+//         let retrieved_private_key =
+//             load_user_key(None, default_path).expect("Unable retrieve key from file");
+
+//         assert_eq!(retrieved_private_key.into_bytes(), private_key.into_bytes(),);
+//     }
+
+//     // tests that when an environment variable is given as the default path load_user_key
+//     // successfully returns the private key
+//     #[test]
+//     fn retrieve_key_success_environment_var() {
+//         let temp_dir = TempDir::new("test_key_dir").expect("Failed to create temp dir");
+
+//         let key_name = "test_key.priv";
+//         let default_path = temp_dir
+//             .path()
+//             .to_str()
+//             .expect("Failed to get default path");
+
+//         let key_path = temp_dir
+//             .path()
+//             .join(key_name)
+//             .to_str()
+//             .expect("Failed to get path")
+//             .to_string();
+
+//         let key = "TEST_KEY_PATH";
+//         env::set_var(key, default_path);
+//         assert_eq!(env::var("TEST_KEY_PATH"), Ok(default_path.to_string()));
+
+//         let mut temp_file =
+//             File::create(&key_path).expect("Unable to create temp private key file");
+
+//         let private_key = PrivateKey::new(vec![
+//             0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+//             0, 0, 1,
+//         ]);
+
+//         writeln!(temp_file, "{}", private_key.as_hex())
+//             .expect("Unable to write private key to file");
+
+//         let retrieved_private_key =
+//             load_user_key(Some(key_name), "TEST_KEY_PATH").expect("Unable retrieve key from file");
+
+//         assert_eq!(retrieved_private_key.into_bytes(), private_key.into_bytes(),);
+//     }
+
+//     // tests that when an environment variable is given as the default path and
+//     // it contains multiple paths load_user_key uses the correct path and successfully
+//     // returns the private key
+//     #[test]
+//     fn retrieve_key_success_environment_var2() {
+//         let temp_dir = TempDir::new("test_key_dir").expect("Failed to create temp dir");
+
+//         let key_name = "test_key.priv";
+//         let default_path = temp_dir
+//             .path()
+//             .to_str()
+//             .expect("Failed to get default path");
+
+//         let key_path = temp_dir
+//             .path()
+//             .join(key_name)
+//             .to_str()
+//             .expect("Failed to get path")
+//             .to_string();
+
+//         let paths = format!("test_key/keys:{}", default_path);
+//         let key = "TEST_PATH_MULTIPLE";
+//         env::set_var(key, paths.clone());
+//         assert_eq!(
+//             env::var("TEST_PATH_MULTIPLE"),
+//             Ok(paths.clone().to_string())
+//         );
+
+//         let mut temp_file =
+//             File::create(&key_path).expect("Unable to create temp private key file");
+
+//         let private_key = PrivateKey::new(vec![
+//             0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+//             0, 0, 1,
+//         ]);
+
+//         writeln!(temp_file, "{}", private_key.as_hex())
+//             .expect("Unable to write private key to file");
+
+//         let retrieved_private_key = load_user_key(Some(key_name), "TEST_PATH_MULTIPLE")
+//             .expect("Unable retrieve key from file");
+
+//         assert_eq!(retrieved_private_key.into_bytes(), private_key.into_bytes(),);
+//     }
+
+//     // tests that if the given file with the given key name is empty load_user_key will fail
+//     #[test]
+//     fn retrieve_key_fail_empty_file() {
+//         let temp_dir = TempDir::new("test_key_dir").expect("Failed to create temp dir");
+
+//         let key_name = "test_key.priv";
+//         let default_path = temp_dir
+//             .path()
+//             .to_str()
+//             .expect("Failed to get default path");
+
+//         let key_path = temp_dir
+//             .path()
+//             .join(key_name)
+//             .to_str()
+//             .expect("Failed to get path")
+//             .to_string();
+
+//         File::create(&key_path).expect("Unable to create temp private key file");
+
+//         assert!(load_user_key(Some(key_name), default_path).is_err());
+//     }
+// }
